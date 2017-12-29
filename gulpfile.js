@@ -27,9 +27,8 @@ const elixir = require('laravel-elixir');
         .browserSync({
             port: 8093,
             open: 'external',
-            host: 'ycms.app',
-            proxy: 'https://ycms.app:8092',
-            https: true,
+            host: 'ycms.localhost',
+            proxy: 'http://ycms.localhost:8092',
             ghostMode: false,
             watchOptions: {
                 ignored: '*.php'
