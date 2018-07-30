@@ -2,46 +2,29 @@
 
 namespace App\Models;
 
+
 use \Shared\Model;
 use App\Service\Sms;
 use Illuminate\Support\Facades\Redis;
 
 class User extends Model
 {
+    const ADMIN_SESSION_DURATION = 40;
+
     protected $connection = 'egecrm';
-
-    protected $fillable = [
-        'login',
-        'password',
-        'color',
-        'type',
-        'id_entity',
-    ];
-
+    protected $table = 'admins';
     protected $commaSeparated = ['rights'];
 
-    public $timestamps = false;
-
-    const USER_TYPE    = 'USER';
+    const USER_TYPE    = 'ADMIN';
     const DEFAULT_COLOR = 'black';
 
-    # Fake system user
-    const SYSTEM_USER = [
-        'id'    => 0,
-        'login' => 'system',
-    ];
-
-    public function setPasswordAttribute($value)
-    {
-        $this->attributes['password'] = static::_password($value);
-    }
 
     /**
      * Если пользователь заблокирован,то его цвет должен быть черным
      */
     public function getColorAttribute()
     {
-        if ($this->allowed(\Shared\Rights::ECC_BANNED)) {
+        if ($this->allowed(\Shared\Rights::ERC_BANNED)) {
             return static::DEFAULT_COLOR;
         } else {
             return $this->attributes['color'];
@@ -49,42 +32,80 @@ class User extends Model
     }
 
     /**
+     * Этот fix нужнен, потому что возвращается instance Carbon
+     */
+    public function getUpdatedAtAttribute($value)
+ 	{
+ 		return $value;
+ 	}
+
+    /**
      * Вход пользователя
      */
     public static function login($data)
     {
-        $User = User::active()->where([
-            'login'         => $data['login'],
-            'password'      => static::_password($data['password']),
-        ]);
+        $query = dbEgecrm('users')->where('email', $data['login']);
 
-        if ($User->exists()) {
-            $user = $User->first();
-            if ($user->allowed(\Shared\Rights::WORLDWIDE_ACCESS) || User::fromOffice()) {
+         # проверка логина
+        if ($query->exists()) {
+            $user_id = $query->value('id_entity');
+        } else {
+            // self::log(null, 'failed_login', 'неверный логин', ['login' => $data['login']]);
+            return false;
+        }
 
-                // Дополнительная СМС-проверка, если пользователь логинится если не из офиса
-                if (! User::fromOffice() && $user->type == User::USER_TYPE) {
-                    $sent_code = Redis::get("eccms:codes:{$user->id}");
+        # проверка пароля
+        $query->where('password', static::_password($data['password']));
+        if (! $query->exists()) {
+            // self::log($user_id, 'failed_login', 'неверный пароль');
+            return false;
+        }
+
+        $user = self::find($query->value('id_entity'));
+
+        # забанен ли?
+        if ($user->isBanned()) {
+            // self::log($user_id, 'failed_login', 'пользователь заблокирован');
+        } else {
+            $allowed_to_login = $user->allowedToLogin();
+
+            # из офиса или есть доступ вне офиса
+            if ($allowed_to_login) {
+                # дополнительная СМС-проверка, если пользователь логинится если не из офиса
+                if ($allowed_to_login->confirm_by_sms) {
+                    $sent_code = Redis::get("ycms:codes:{$user_id}");
                     // если уже был отправлен – проверяем
                     if (! empty($sent_code)) {
                         if (@$data['code'] != $sent_code) {
+                            // self::log($user_id, 'failed_login', 'неверный смс-код');
                             return false;
                         } else {
-                            Redis::del("eccms:codes:{$user->id}");
+                            Redis::del("ycms:codes:{$user_id}");
                         }
                     } else {
-                    // иначе отправляем код
+                        // иначе отправляем код
+                        // self::log($user_id, 'sms_code_sent');
                         Sms::verify($user);
                         return 'sms';
                     }
                 }
-
-                $_SESSION['user'] = $user;
+                // self::log($user_id, 'success_login');
+                $user->toSession();
                 return true;
+            } else {
+                // self::log($user_id, 'failed_login', 'нет прав доступа для данного IP');
             }
         }
         return false;
     }
+
+    public static function _password($password)
+	{
+		$password = md5($password."_rM");
+        $password = md5($password."Mr");
+		return $password;
+	}
+
 
     public static function logout()
     {
@@ -96,20 +117,11 @@ class User extends Model
 	 */
 	public static function loggedIn()
 	{
-		return isset($_SESSION["user"]) // пользователь залогинен
-            && ! User::isBlocked()      // и не заблокирован
-            && User::worldwideAccess()  // и можно входить
-            && User::notChanged();      // и данные не изменились
+        return isset($_SESSION["user"]) && $_SESSION["user"] 	// пользователь залогинен
+            && ! User::fromSession()->isBanned()      			// и не заблокирован
+            && User::fromSession()->allowedToLogin() 			// и можно входить
+            && User::notChanged();      						// и данные по пользователю не изменились
 	}
-
-    /**
-     * Данные по пользователю не изменились
-     * если поменяли в настройках хоть что-то, сразу выкидывает, чтобы перезайти
-     */
-    public static function notChanged()
-    {
-        return User::fromSession()->updated_at == dbEgecrm('users')->whereId(User::fromSession()->id)->value('updated_at');
-    }
 
     /*
 	 * Пользователь из сессии
@@ -131,6 +143,11 @@ class User extends Model
 		return $User;
 	}
 
+    public static function id()
+    {
+        return User::fromSession()->id;
+    }
+
     /**
      * Текущего пользователя в сессию
      */
@@ -138,26 +155,6 @@ class User extends Model
     {
         $_SESSION['user'] = $this;
     }
-
-    /**
-     * Вернуть системного пользователя
-     */
-    public static function getSystem()
-    {
-        return (object)static::SYSTEM_USER;
-    }
-
-    /**
-	 * Вернуть пароль, как в репетиторах
-	 *
-	 */
-	private static function _password($password)
-	{
-		$password = md5($password."_rM");
-        $password = md5($password."Mr");
-
-		return $password;
-	}
 
     /**
      * Get real users
@@ -174,41 +171,21 @@ class User extends Model
      */
     public static function scopeActive($query)
     {
-        return $query->real()->whereRaw('NOT FIND_IN_SET(' . \Shared\Rights::ECC_BANNED . ', rights)');
+        return $query->whereRaw('NOT FIND_IN_SET(' . \Shared\Rights::ERC_BANNED . ', rights)');
     }
 
-    public static function isBlocked()
+    public function isBanned()
     {
-        return User::whereId(User::fromSession()->id)
-                ->whereRaw('FIND_IN_SET(' . \Shared\Rights::ECC_BANNED . ', rights)')
-                ->exists();
-    }
-
-    /**
-     * Логин из офиса
-     */
-    public static function fromOffice()
-    {
-        if (app('env') === 'local') {
-            return true;
-        }
-        $current_ip = @$_SERVER['HTTP_X_REAL_IP'];
-        foreach(['213.184.130.', '77.37.220.250'] as $ip) {
-            if (strpos($current_ip, $ip) === 0) {
-                return true;
-            }
-        }
-        return false;
+        return $this->allowed(\Shared\Rights::ERC_BANNED);
     }
 
     /**
-     * Вход из офиса или включена настройка «доступ отовсюду»
+     * Данные по пользователю не изменились
+     * если поменяли в настройках хоть что-то, сразу выкидывает, чтобы перезайти
      */
-    public static function worldwideAccess()
+    public static function notChanged()
     {
-        return User::fromOffice() || User::whereId(User::fromSession()->id)
-                ->whereRaw('FIND_IN_SET(' . \Shared\Rights::WORLDWIDE_ACCESS . ', rights)')
-                ->exists();
+        return User::fromSession()->updated_at == dbEgecrm('admins')->whereId(User::id())->value('updated_at');
     }
 
     /**
@@ -218,4 +195,28 @@ class User extends Model
     {
         return in_array($right, $this->rights);
     }
+
+    /**
+	 * Можно ли логиниться с этого IP?
+	 */
+	public function allowedToLogin()
+	{
+        if (app('env') === 'local') {
+            return (object)[
+                'confirm_by_sms' => false
+            ];
+        }
+
+        $current_ip = ip2long($_SERVER['HTTP_X_REAL_IP']);
+        $admin_ips = dbEgecrm('admin_ips')->where('id_admin', $this->id)->get();
+        foreach($admin_ips as $admin_ip) {
+            $ip_from = ip2long(trim($admin_ip->ip_from));
+            $ip_to = ip2long(trim($admin_ip->ip_to ?: $admin_ip->ip_from));
+            if ($current_ip >= $ip_from && $current_ip <= $ip_to) {
+                return $admin_ip;
+            }
+        }
+
+        return false;
+	}
 }
